@@ -5,6 +5,27 @@
 exec 9>/home/web/certs/.kpanel-certificate.lock || exit 1
 flock -w 30 9 || exit 1
 
+# Remember only a pair previously observed in this host's Certbot lineage.
+# Certbot's legacy delete-before-issue flow may temporarily remove that lineage.
+kpanel_certificate_automatic() (
+    local cert="$1" key="$2" proof="${certs_directory}${yuming}.auto-renewal"
+    local pair temporary=""
+    [ -f "$cert" ] && [ ! -L "$cert" ] && [ -f "$key" ] && [ ! -L "$key" ] || return 1
+    [ ! -L "$proof" ] && { [ ! -e "$proof" ] || { [ -f "$proof" ] && [ "$(stat -c %u "$proof")" = 0 ] && [ "$(stat -c %a "$proof")" = 600 ]; }; } || return 1
+    pair="$(sha256sum "$cert" | awk '{print $1}') $(sha256sum "$key" | awk '{print $1}')"
+    [[ "$pair" =~ ^[a-f0-9]{64}\ [a-f0-9]{64}$ ]] || return 1
+    if cmp -s "/etc/letsencrypt/live/$yuming/fullchain.pem" "$cert" && cmp -s "/etc/letsencrypt/live/$yuming/privkey.pem" "$key"; then
+        umask 077
+        trap 'rm -f -- "$temporary"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        temporary=$(mktemp "${proof}.XXXXXX") || return 1
+        printf '%s\n' "$pair" > "$temporary" && chmod 600 "$temporary" && mv -f -- "$temporary" "$proof"
+    else
+        [ -f "$proof" ] && [ "$(wc -c < "$proof")" = 130 ] && [ "$(cat "$proof")" = "$pair" ]
+    fi
+)
+
 # 定义证书存储目录
 certs_directory="/home/web/certs/"
 days_before_expiry=15  # 设置在证书到期前几天触发续签
@@ -14,11 +35,10 @@ for cert_file in $certs_directory*_cert.pem; do
     # 获取域名
     yuming=$(basename "$cert_file" "_cert.pem")
     # Custom material is renewed by its owner; the PEM files remain the truth.
-    if [ -e "${certs_directory}${yuming}.custom" ]; then
+    if [ -e "${certs_directory}${yuming}.custom" ] || [ -L "${certs_directory}${yuming}.custom" ]; then
         continue
     fi
-    if ! cmp -s "/etc/letsencrypt/live/$yuming/fullchain.pem" "$cert_file" || ! cmp -s "/etc/letsencrypt/live/$yuming/privkey.pem" "${certs_directory}${yuming}_key.pem"; then
-        # Unmarked legacy material is automatic only when its Certbot lineage matches.
+    if ! kpanel_certificate_automatic "$cert_file" "${certs_directory}${yuming}_key.pem"; then
         continue
     fi
 

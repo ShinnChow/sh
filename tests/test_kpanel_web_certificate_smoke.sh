@@ -23,7 +23,7 @@ fi
 mkdir -p "$fixture_root/web/conf.d" "$fixture_root/web/certs"
 # Rebuild the exact old official fixture and prove its migration is byte-for-byte
 # equal to the current authoritative renewal script. No host cron is touched.
-awk 'NR >= 8 { if ($0 == "    # Custom material is renewed by its owner; the PEM files remain the truth.") { skip=7; next } if (skip) { skip--; next } print }' "$root/auto_cert_renewal.sh" > "$fixture_root/auto_cert_renewal.sh"
+awk '$0 == "# 定义证书存储目录" { body=1 } body { if ($0 == "    # Custom material is renewed by its owner; the PEM files remain the truth.") { skip=6; next } if (skip) { skip--; next } print }' "$root/auto_cert_renewal.sh" > "$fixture_root/auto_cert_renewal.sh"
 chmod 700 "$fixture_root/auto_cert_renewal.sh"
 sed "s|~root/auto_cert_renewal.sh|$fixture_root/auto_cert_renewal.sh|g" "$fixture_root/functions.sh" > "$fixture_root/migration.sh"
 source "$fixture_root/migration.sh"
@@ -109,6 +109,20 @@ kpanel_web_upgrade_certificate_renewal() { return 0; }
 # Creation imports a pair without writing Let’s Encrypt state or overwriting an existing pair.
 yuming=created.example.com
 MSYS2_ARG_CONV_EXCL=/CN= openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=created.example.com -addext subjectAltName=DNS:created.example.com -keyout "$fixture_root/key.pem" -out "$fixture_root/cert.pem" >/dev/null 2>&1
+# Interrupt after each published hard link, before the transaction commits.
+# Only this transaction's inodes and private staging files may be removed.
+for interrupt_target in "$fixture_root/web/certs/created.example.com_cert.pem" "$fixture_root/web/certs/created.example.com_key.pem" "$fixture_root/web/certs/created.example.com.custom"; do
+	ln() { command ln "$@" || return; if [ "$2" = "$interrupt_target" ]; then kill -TERM "$BASHPID"; fi; }
+	creation_status=0
+	kpanel_web_prepare_custom_certificate || creation_status=$?
+	unset -f ln
+	[ "$creation_status" = 143 ]
+	[ ! -e "$fixture_root/web/certs/created.example.com_cert.pem" ]
+	[ ! -e "$fixture_root/web/certs/created.example.com_key.pem" ]
+	[ ! -e "$fixture_root/web/certs/created.example.com.custom" ]
+	[ -z "$(find "$fixture_root/web/certs" -maxdepth 1 \( -name '.kpanel-created.example.com.*' -o -name '.kpanel-policy.*' \) -print)" ]
+done
+printf 'certificate_creation_term_cleanup=pass\n'
 kpanel_web_prepare_custom_certificate
 if kpanel_web_prepare_custom_certificate; then exit 1; fi
 cmp "$fixture_root/web/certs/created.example.com_cert.pem" "$fixture_root/cert.pem"
@@ -128,8 +142,34 @@ bash "$fixture_root/renewal-isolated.sh" >> "$fixture_root/renewal.log" 2>&1
 mkdir -p "$fixture_root/letsencrypt/live/example.com"
 cp "$cert" "$fixture_root/letsencrypt/live/example.com/fullchain.pem"
 cp "$key" "$fixture_root/letsencrypt/live/example.com/privkey.pem"
+# Preserve retry eligibility after legacy Certbot delete succeeds but issue fails.
+docker() {
+	printf '%s\n' "$*" >> "$fixture_root/renewal-calls"
+	case " $* " in
+		*' certbot/certbot delete '*) rm -f -- "$fixture_root/letsencrypt/live/example.com/fullchain.pem" "$fixture_root/letsencrypt/live/example.com/privkey.pem"; return 0 ;;
+		*' certbot/certbot certonly '*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+export -f docker
+served_cert_hash=$(hash "$cert"); served_key_hash=$(hash "$key")
 bash "$fixture_root/renewal-isolated.sh" >> "$fixture_root/renewal.log" 2>&1
-[ "$(cat "$fixture_root/docker-count")" -gt 0 ]
+[ "$(grep -c 'certbot/certbot certonly' "$fixture_root/renewal-calls")" = 1 ]
+[ ! -e "$fixture_root/letsencrypt/live/example.com/fullchain.pem" ]
+bash "$fixture_root/renewal-isolated.sh" >> "$fixture_root/renewal.log" 2>&1
+[ "$(grep -c 'certbot/certbot certonly' "$fixture_root/renewal-calls")" = 2 ]
+[ "$(hash "$cert")" = "$served_cert_hash" ]; [ "$(hash "$key")" = "$served_key_hash" ]
+[ "$(stat -c %a "$fixture_root/web/certs/example.com.auto-renewal")" = 600 ]
+# Custom policy wins even when an automatic proof already exists.
+printf 'custom-v1\n' > "$fixture_root/web/certs/example.com.custom"
+bash "$fixture_root/renewal-isolated.sh" >> "$fixture_root/renewal.log" 2>&1
+[ "$(grep -c 'certbot/certbot certonly' "$fixture_root/renewal-calls")" = 2 ]
+rm "$fixture_root/web/certs/example.com.custom"
+# An external pair change cannot inherit the previous automatic eligibility.
+cp "$fixture_root/cert.pem" "$cert"; cp "$fixture_root/key.pem" "$key"
+bash "$fixture_root/renewal-isolated.sh" >> "$fixture_root/renewal.log" 2>&1
+[ "$(grep -c 'certbot/certbot certonly' "$fixture_root/renewal-calls")" = 2 ]
+printf 'automatic_renewal_retry_and_custom_protection=pass\n'
 grep -Fx 'KPANEL_CERTIFICATE conflict' "$fixture_root/receipt" >/dev/null
 # A detached worker owns disposal even when its Agent caller is gone.
 private_dir=$(mktemp -d "$fixture_root/certificate-replace-XXXXXX")

@@ -1472,7 +1472,7 @@ install_certbot() {
 		fi
 		renewal_digest=$(sha256sum "$renewal_download" | awk '{print $1}')
 		if [ "$renewal_digest" != ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83 ] &&
-		   [ "$renewal_digest" != b117c82fe949d23c745902f633bd343cd13d8a929bb17dd51534fb12af46669d ]; then
+		   [ "$renewal_digest" != 3a63b9e0c1557fae9e18983a8eee284476a946a811c11b3076535aab1432e0d0 ]; then
 			rm -f "$renewal_download"
 			return 1
 		fi
@@ -1498,6 +1498,27 @@ kpanel_web_certificate_renewal_header() {
 exec 9>/home/web/certs/.kpanel-certificate.lock || exit 1
 flock -w 30 9 || exit 1
 
+# Remember only a pair previously observed in this host's Certbot lineage.
+# Certbot's legacy delete-before-issue flow may temporarily remove that lineage.
+kpanel_certificate_automatic() (
+    local cert="$1" key="$2" proof="${certs_directory}${yuming}.auto-renewal"
+    local pair temporary=""
+    [ -f "$cert" ] && [ ! -L "$cert" ] && [ -f "$key" ] && [ ! -L "$key" ] || return 1
+    [ ! -L "$proof" ] && { [ ! -e "$proof" ] || { [ -f "$proof" ] && [ "$(stat -c %u "$proof")" = 0 ] && [ "$(stat -c %a "$proof")" = 600 ]; }; } || return 1
+    pair="$(sha256sum "$cert" | awk '{print $1}') $(sha256sum "$key" | awk '{print $1}')"
+    [[ "$pair" =~ ^[a-f0-9]{64}\ [a-f0-9]{64}$ ]] || return 1
+    if cmp -s "/etc/letsencrypt/live/$yuming/fullchain.pem" "$cert" && cmp -s "/etc/letsencrypt/live/$yuming/privkey.pem" "$key"; then
+        umask 077
+        trap 'rm -f -- "$temporary"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        temporary=$(mktemp "${proof}.XXXXXX") || return 1
+        printf '%s\n' "$pair" > "$temporary" && chmod 600 "$temporary" && mv -f -- "$temporary" "$proof"
+    else
+        [ -f "$proof" ] && [ "$(wc -c < "$proof")" = 130 ] && [ "$(cat "$proof")" = "$pair" ]
+    fi
+)
+
 KPANEL_RENEWAL_HEADER
 }
 
@@ -1512,7 +1533,7 @@ kpanel_web_upgrade_certificate_renewal() (
 	(( (8#$mode & 022) == 0 )) || return 1
 	local digest
 	digest=$(sha256sum "$renewal" | awk '{print $1}')
-	if [ "$digest" = b117c82fe949d23c745902f633bd343cd13d8a929bb17dd51534fb12af46669d ]; then
+	if [ "$digest" = 3a63b9e0c1557fae9e18983a8eee284476a946a811c11b3076535aab1432e0d0 ]; then
 		! pgrep -f -- "$renewal" >/dev/null 2>&1
 		return $?
 	fi
@@ -1526,17 +1547,16 @@ kpanel_web_upgrade_certificate_renewal() (
 			{ print }
 			$0 == "    yuming=$(basename \"$cert_file\" \"_cert.pem\")" {
 				print "    # Custom material is renewed by its owner; the PEM files remain the truth."
-				print "    if [ -e \"${certs_directory}${yuming}.custom\" ]; then"
+				print "    if [ -e \"${certs_directory}${yuming}.custom\" ] || [ -L \"${certs_directory}${yuming}.custom\" ]; then"
 				print "        continue"
 				print "    fi"
-				print "    if ! cmp -s \"/etc/letsencrypt/live/$yuming/fullchain.pem\" \"$cert_file\" || ! cmp -s \"/etc/letsencrypt/live/$yuming/privkey.pem\" \"${certs_directory}${yuming}_key.pem\"; then"
-				print "        # Unmarked legacy material is automatic only when its Certbot lineage matches."
+				print "    if ! kpanel_certificate_automatic \"$cert_file\" \"${certs_directory}${yuming}_key.pem\"; then"
 				print "        continue"
 				print "    fi"
 			}
 		' "$renewal"
 	} > "$temporary" || return 1
-	[ "$(sha256sum "$temporary" | awk '{print $1}')" = b117c82fe949d23c745902f633bd343cd13d8a929bb17dd51534fb12af46669d ] || return 1
+	[ "$(sha256sum "$temporary" | awk '{print $1}')" = 3a63b9e0c1557fae9e18983a8eee284476a946a811c11b3076535aab1432e0d0 ] || return 1
 	chmod 700 "$temporary" || return 1
 	[ "$(sha256sum "$renewal" | awk '{print $1}')" = "$digest" ] || return 1
 	mv -f "$temporary" "$renewal" || return 1
@@ -1634,36 +1654,37 @@ kpanel_web_prepare_custom_certificate() (
 	[ ! -e "$cert_target" ] && [ ! -e "$key_target" ] && [ ! -e "$target_dir/${yuming}.custom" ] && [ ! -L "$target_dir/${yuming}.custom" ] || return 1
 	local cert_tmp=""
 	local key_tmp=""
+	local policy_tmp="" committed=0
+	kpanel_web_cleanup_created_certificate() {
+		local status=$?
+		trap - EXIT INT TERM
+		if [ "$committed" = 0 ]; then
+			# Links identify this transaction's files even if interrupted inside ln.
+			if [ -n "$cert_tmp" ] && [ ! -L "$cert_target" ] && [ "$cert_tmp" -ef "$cert_target" ]; then rm -f -- "$cert_target" || status=1; fi
+			if [ -n "$key_tmp" ] && [ ! -L "$key_target" ] && [ "$key_tmp" -ef "$key_target" ]; then rm -f -- "$key_target" || status=1; fi
+			if [ -n "$policy_tmp" ] && [ ! -L "$target_dir/${yuming}.custom" ] && [ "$policy_tmp" -ef "$target_dir/${yuming}.custom" ]; then rm -f -- "$target_dir/${yuming}.custom" || status=1; fi
+		fi
+		rm -f -- "$cert_tmp" "$key_tmp" "$policy_tmp" || status=1
+		exit "$status"
+	}
+	trap kpanel_web_cleanup_created_certificate EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
 	cert_tmp=$(mktemp "$target_dir/.kpanel-${yuming}.cert.XXXXXX") || return 1
-	key_tmp=$(mktemp "$target_dir/.kpanel-${yuming}.key.XXXXXX") || { rm -f "$cert_tmp"; return 1; }
-	chmod 600 "$cert_tmp" "$key_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+	key_tmp=$(mktemp "$target_dir/.kpanel-${yuming}.key.XXXXXX") || return 1
+	chmod 600 "$cert_tmp" "$key_tmp" || return 1
 	if ! cp "$cert_file" "$cert_tmp" || ! cp "$key_file" "$key_tmp" ||
 		! chmod 644 "$cert_tmp" || ! chmod 600 "$key_tmp" ||
 		! ln "$cert_tmp" "$cert_target"; then
-		rm -f "$cert_tmp" "$key_tmp"
 		echo "KPANEL_PROGRESS 100 写入自定义证书失败"
 		return 1
 	fi
-	if ! ln "$key_tmp" "$key_target"; then
-		[ "$cert_tmp" -ef "$cert_target" ] && rm -f "$cert_target"
-		rm -f "$cert_tmp" "$key_tmp"
-		return 1
-	fi
-	local policy_tmp
-	policy_tmp=$(mktemp "$target_dir/.kpanel-policy.XXXXXX") || {
-		[ "$cert_tmp" -ef "$cert_target" ] && rm -f "$cert_target"
-		[ "$key_tmp" -ef "$key_target" ] && rm -f "$key_target"
-		rm -f "$cert_tmp" "$key_tmp"
-		return 1
-	}
+	ln "$key_tmp" "$key_target" || return 1
+	policy_tmp=$(mktemp "$target_dir/.kpanel-policy.XXXXXX") || return 1
 	if ! printf 'custom-v1\n' > "$policy_tmp" || ! ln "$policy_tmp" "$target_dir/${yuming}.custom"; then
-		[ "$cert_tmp" -ef "$cert_target" ] && rm -f "$cert_target"
-		[ "$key_tmp" -ef "$key_target" ] && rm -f "$key_target"
-		rm -f "$cert_tmp" "$key_tmp" "$policy_tmp"
 		return 1
 	fi
-	rm -f "$policy_tmp"
-	rm -f "$cert_tmp" "$key_tmp"
+	committed=1
 	return 0
 )
 
@@ -2238,6 +2259,7 @@ web_del() {
 		rm -f -- "/home/web/certs/${yuming}_key.pem" > /dev/null 2>&1
 		rm -f -- "/home/web/certs/${yuming}_cert.pem" > /dev/null 2>&1
 		rm -f -- "/home/web/certs/${yuming}.custom" > /dev/null 2>&1
+		rm -f -- "/home/web/certs/${yuming}.auto-renewal" > /dev/null 2>&1
 
 		# 将域名转换为数据库名
 		dbname=$(echo "$yuming" | sed -e 's/[^A-Za-z0-9]/_/g')
