@@ -222,6 +222,8 @@ chown() { command chown "${1/kejilion-node/65534}" "${@:2}"; }
         self.assertIn('optional service unavailable', result.stderr)
         self.assertEqual(self.binary.read_bytes(), (self.root / 'release').read_bytes())
         self.assertFalse((self.root / 'home/kejilion-node.previous').exists())
+        status = json.loads((self.root / 'config/update-status.json').read_text())
+        self.assertEqual((status['state'], status['errorCode']), ('degraded', 'optional_service'))
 
     def test_failed_core_rolls_back_and_restart_failure_cannot_be_masked(self):
         before = self.binary.read_bytes()
@@ -229,6 +231,61 @@ chown() { command chown "${1/kejilion-node/65534}" "${@:2}"; }
         result = self.run_update(False)
         self.assertIn('was rolled back', result.stderr)
         self.assertEqual(self.binary.read_bytes(), before)
+        status = json.loads((self.root / 'config/update-status.json').read_text())
+        self.assertEqual((status['state'], status['errorCode']), ('rolled_back', 'restart'))
+
+    def test_update_status_is_private_bounded_and_tracks_checks(self):
+        self.run_update()
+        path = self.root / 'config/update-status.json'
+        value = json.loads(path.read_text())
+        self.assertEqual(value['state'], 'updated')
+        self.assertEqual(value['errorCode'], '')
+        self.assertLessEqual(value['checkedAt'], value['finishedAt'])
+        self.assertLess(path.stat().st_size, 1024)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual((path.stat().st_uid, path.stat().st_gid), (0, 65534))
+        self.assertEqual(set(value), {'state', 'checkedAt', 'finishedAt', 'errorCode'})
+        self.run_update()
+        self.assertEqual(json.loads(path.read_text())['state'], 'current')
+        (self.root / 'network-down').touch()
+        self.run_update(False)
+        value = json.loads(path.read_text())
+        self.assertEqual((value['state'], value['errorCode']), ('failed', 'release_check'))
+        self.assertFalse((self.root / 'config/.update-status.pending').exists())
+
+    def test_update_status_rejects_symlink_without_overwriting_target(self):
+        target = self.root / 'untouched'
+        target.write_text('private sentinel')
+        (self.root / 'config/update-status.json').symlink_to(target)
+        result = self.run_update()
+        self.assertIn('status could not be recorded', result.stderr)
+        self.assertEqual(target.read_text(), 'private sentinel')
+
+    def test_running_status_survives_kill_and_next_check_recovers(self):
+        (self.root / 'pause-download').touch()
+        process = subprocess.Popen(['/bin/bash', str(self.root / 'update.sh'), 'update'],
+                                   cwd=self.root, env=self.env, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+        path = self.root / 'config/update-status.json'
+        try:
+            for _ in range(200):
+                if (self.root / 'download-waiting').exists(): break
+                time.sleep(0.02)
+            self.assertTrue((self.root / 'download-waiting').exists())
+            self.assertEqual(json.loads(path.read_text())['state'], 'running')
+            before = path.read_bytes()
+            self.run_update(False)
+            self.assertEqual(path.read_bytes(), before, 'lock loser overwrote owner status')
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            self.assertEqual(json.loads(path.read_text())['state'], 'running')
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+        (self.root / 'pause-download').unlink()
+        self.run_update()
+        self.assertEqual(json.loads(path.read_text())['state'], 'updated')
 
     def test_current_file_with_old_process_recovers_without_binary_download(self):
         subprocess.run([str(self.root / 'bin/systemctl'), 'restart', 'kejilion-node.service'], env=self.env, check=True)
