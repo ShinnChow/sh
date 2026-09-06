@@ -1,3 +1,10 @@
+#!/bin/bash
+# KPANEL_WEB_CERTIFICATE_RENEWAL_PROTOCOL_VERSION=1
+[ -d /home/web/certs ] && [ ! -L /home/web/certs ] || exit 1
+[ ! -L /home/web/certs/.kpanel-certificate.lock ] || exit 1
+exec 9>/home/web/certs/.kpanel-certificate.lock || exit 1
+flock -w 30 9 || exit 1
+
 # 定义证书存储目录
 certs_directory="/home/web/certs/"
 days_before_expiry=15  # 设置在证书到期前几天触发续签
@@ -6,6 +13,14 @@ days_before_expiry=15  # 设置在证书到期前几天触发续签
 for cert_file in $certs_directory*_cert.pem; do
     # 获取域名
     yuming=$(basename "$cert_file" "_cert.pem")
+    # Custom material is renewed by its owner; the PEM files remain the truth.
+    if [ -e "${certs_directory}${yuming}.custom" ]; then
+        continue
+    fi
+    if ! cmp -s "/etc/letsencrypt/live/$yuming/fullchain.pem" "$cert_file" || ! cmp -s "/etc/letsencrypt/live/$yuming/privkey.pem" "${certs_directory}${yuming}_key.pem"; then
+        # Unmarked legacy material is automatic only when its Certbot lineage matches.
+        continue
+    fi
 
     # 输出正在检查的证书信息
     echo "检查证书过期日期： ${yuming}"
