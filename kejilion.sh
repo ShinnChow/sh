@@ -1537,13 +1537,26 @@ kpanel_web_upgrade_certificate_renewal() (
 		! pgrep -f -- "$renewal" >/dev/null 2>&1
 		return $?
 	fi
-	[ "$digest" = ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83 ] || return 1
+	# Recognize exact official revisions, including the first v1 renewal entry
+	# and the older entry whose only extra content is commented firewall commands.
+	# Never rewrite an unknown locally edited renewal policy.
+	case "$digest" in
+		ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83|\
+		b117c82fe949d23c745902f633bd343cd13d8a929bb17dd51534fb12af46669d|\
+		90ec47433699bc981c5a146b9853ab1ed220540abbb553bd373e87c42615c7d1) ;;
+		*) return 1 ;;
+	esac
 	local temporary
 	temporary=$(mktemp "${renewal}.XXXXXX") || return 1
 	trap 'rm -f -- "$temporary"' EXIT
 	{
 		kpanel_web_certificate_renewal_header
 		awk '
+			$0 == "# 定义证书存储目录" { body=1 }
+			!body { next }
+			skip { skip--; next }
+			$0 == "    # Custom material is renewed by its owner; the PEM files remain the truth." { skip=7; next }
+			$0 == "            # if ! iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null; then" { skip=13; next }
 			{ print }
 			$0 == "    yuming=$(basename \"$cert_file\" \"_cert.pem\")" {
 				print "    # Custom material is renewed by its owner; the PEM files remain the truth."

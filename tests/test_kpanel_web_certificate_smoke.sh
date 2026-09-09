@@ -29,9 +29,25 @@ sed "s|~root/auto_cert_renewal.sh|$fixture_root/auto_cert_renewal.sh|g" "$fixtur
 source "$fixture_root/migration.sh"
 kpanel_web_upgrade_certificate_renewal
 cmp "$fixture_root/auto_cert_renewal.sh" "$root/auto_cert_renewal.sh"
+# These fixtures are byte-exact official history, not reconstructed samples:
+# b3d0d35 introduced v1 protection; 014f450 still contained commented firewall rules.
+for revision in b3d0d35 014f450; do
+	cp "$root/tests/fixtures/certificate-renewal-$revision.sh" "$fixture_root/auto_cert_renewal.sh"
+	chmod 700 "$fixture_root/auto_cert_renewal.sh"
+	kpanel_web_upgrade_certificate_renewal
+	cmp "$fixture_root/auto_cert_renewal.sh" "$root/auto_cert_renewal.sh"
+	# A second call must accept the migrated result without changing it.
+	kpanel_web_upgrade_certificate_renewal
+	cmp "$fixture_root/auto_cert_renewal.sh" "$root/auto_cert_renewal.sh"
+done
+pgrep() { return 0; }
+if kpanel_web_upgrade_certificate_renewal; then exit 1; fi
+unset -f pgrep
+cmp "$fixture_root/auto_cert_renewal.sh" "$root/auto_cert_renewal.sh"
 echo '# locally customized' >> "$fixture_root/auto_cert_renewal.sh"
 if kpanel_web_upgrade_certificate_renewal; then exit 1; fi
 grep -F '# locally customized' "$fixture_root/auto_cert_renewal.sh" >/dev/null
+printf 'official_renewal_migration_and_running_guard=pass\n'
 rm "$fixture_root/auto_cert_renewal.sh"
 sed "s|/home/web|$fixture_root/web|g" "$fixture_root/functions.sh" > "$fixture_root/isolated.sh"
 source "$fixture_root/isolated.sh"
