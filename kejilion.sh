@@ -23873,11 +23873,12 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 		fi
 		  ;;
 	esac
+	local app_action_status=$?
 	if [ "${KJ_APP_NONINTERACTIVE:-}" = "1" ]; then
-		return
+		return "$app_action_status"
 	fi
 	if [ "${KJ_APP_INTERACTIVE:-}" = "1" ]; then
-		return
+		return "$app_action_status"
 	fi
 	break_end
 	sub_choice=""
