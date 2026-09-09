@@ -12756,10 +12756,33 @@ fix_phpfpm_conf() {
 
 
 
+KPANEL_WEB_REDIRECT_PROTOCOL_VERSION="1"
+
+kpanel_web_redirect_target_valid() {
+	local target="${1:-}" label
+	[ ${#target} -le 253 ] && [[ "$target" == *.* ]] || return 1
+	[[ "$target" =~ ^[a-zA-Z0-9.-]+$ ]] && [[ "$target" != *..* ]] || return 1
+	local -a labels
+	IFS=. read -r -a labels <<< "$target"
+	[[ "$target" != *. ]] || return 1
+	for label in "${labels[@]}"; do
+		[ ${#label} -le 63 ] && [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+	done
+	[[ "${labels[-1]}" =~ [a-zA-Z] ]]
+}
+
 kpanel_run_web_recipe_cli() {
 	local selector="${1:-}"
 	local domain="${2:-}"
-	if [ "$#" -ne 2 ]; then
+	local KJ_WEB_REDIRECT_TARGET=""
+	if [ "$selector" = "22" ] && [ "$#" -eq 3 ]; then
+		KJ_WEB_REDIRECT_TARGET="${3,,}"
+		if ! kpanel_web_redirect_target_valid "$KJ_WEB_REDIRECT_TARGET" ||
+			[ "$KJ_WEB_REDIRECT_TARGET" = "${domain,,}" ]; then
+			echo "KPANEL_PROGRESS 100 跳转目标必须是不同于原域名的有效域名"
+			return 64
+		fi
+	elif [ "$#" -ne 2 ]; then
 		echo "用法: k <建站命令> <域名>"
 		return 64
 	fi
@@ -13881,23 +13904,32 @@ linux_ldnmp() {
 	  webname="站点重定向"
 	  send_stats "安装$webname"
 	  echo "开始部署 $webname"
-	  add_yuming
-	  read -e -p "请输入跳转域名: " reverseproxy
-	  nginx_install_status
+	  add_yuming || return 1
+	  reverseproxy="${KJ_WEB_REDIRECT_TARGET:-}"
+	  if [ -z "$reverseproxy" ]; then
+		read -e -p "请输入跳转域名: " reverseproxy || return 1
+	  fi
+	  nginx_install_status || return 1
 
 
 
-	  install_ssltls
-	  certs_status
+	  if ! install_ssltls; then
+		# Preserve the script's retry/import dialog after issuance failure. A
+		# failure with an available pair (for example nginx start) must stop.
+		if kpanel_web_certificate_available; then return 1; fi
+	  fi
+	  certs_status || return 1
+	  kpanel_web_certificate_available || return 1
 
 
-	  wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/rewrite.conf
-	  sed -i "s/yuming.com/$yuming/g" /home/web/conf.d/$yuming.conf
-	  sed -i "s/baidu.com/$reverseproxy/g" /home/web/conf.d/$yuming.conf
+	  wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/rewrite.conf || return 1
+	  sed -i "s/yuming.com/$yuming/g" /home/web/conf.d/$yuming.conf || return 1
+	  sed -i "s/baidu.com/$reverseproxy/g" /home/web/conf.d/$yuming.conf || return 1
 
 	  nginx_http_on
 
-	  docker exec nginx nginx -s reload
+	  docker exec nginx nginx -t || return 1
+	  docker exec nginx nginx -s reload || return 1
 
 	  nginx_web_on
 
